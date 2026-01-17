@@ -14,3 +14,7 @@ ffmpeg
 static/tmp
 static/file
 stslib/__pycache__
+models/.DS_Store
+.DS_Store
+/__pycache__
+/models

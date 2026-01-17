@@ -1,7 +1,11 @@
-torch==2.1.2
+torch
+torchaudio
 flask
 requests
 gevent
 faster-whisper
 fsspec
 opencc-python-reimplemented
+mlx-whisper; sys_platform == 'darwin'
+funasr
+transformers

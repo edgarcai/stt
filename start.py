@@ -12,7 +12,7 @@ warnings.filterwarnings('ignore')
 import stslib
 from stslib import cfg, tool
 from stslib.cfg import ROOT_DIR
-from faster_whisper import WhisperModel
+from stslib.whisper_adapter import WhisperModelAdapter, get_optimal_device, create_whisper_model
 import time
 from werkzeug.utils import secure_filename
 import uuid
@@ -137,9 +137,9 @@ def shibie():
         if not modelobj:
             try:
                 print(f'开始加载模型，若不存在将自动下载')
-                modelobj= WhisperModel(
-                    model  if not model.startswith('distil') else  model.replace('-whisper', ''), 
-                    device=sets.get('devtype'), 
+                modelobj = create_whisper_model(
+                    model,
+                    device_type=sets.get('devtype'),
                     download_root=cfg.ROOT_DIR + "/models"
                 )
                 cfg.MODEL_DICT[model]=modelobj
@@ -161,7 +161,10 @@ def shibie():
 
             raw_subtitles = []
             for segment in segments:
-                cfg.progressbar[key]=round(segment.end/total_duration, 2)
+                if total_duration > 0:
+                    cfg.progressbar[key]=round(segment.end/total_duration, 2)
+                else:
+                    cfg.progressbar[key]=1.0
                 start = int(segment.start * 1000)
                 end = int(segment.end * 1000)
                 startTime = tool.ms_to_time_string(ms=start)
@@ -359,11 +362,9 @@ def api():
 def _api_process(model_name,wav_file,language=None,response_format="text",prompt=None):
     try:
         sets=cfg.parse_ini()
-        if model_name.startswith('distil-'):
-            model_name = model_name.replace('-whisper', '')
-        model = WhisperModel(
-            model_name, 
-            device=sets.get('devtype'), 
+        model = create_whisper_model(
+            model_name,
+            device_type=sets.get('devtype'),
             download_root=cfg.ROOT_DIR + "/models"
         )
     except Exception as e:
@@ -414,8 +415,15 @@ if __name__ == '__main__':
         threading.Thread(target=tool.checkupdate).start()
         threading.Thread(target=shibie).start()
         try:
-            if cfg.devtype=='cpu':
-                print('\n如果设备使用英伟达显卡并且CUDA环境已正确安装，可修改set.ini中\ndevtype=cpu 为 devtype=cuda, 然后重新启动以加快识别速度\n')
+            # 显示设备类型提示
+            actual_device = get_optimal_device() if cfg.devtype == 'auto' else cfg.devtype
+            if actual_device == 'mlx':
+                print('\n已检测到 Apple Silicon，将使用 MLX 加速模式进行推理\n')
+            elif actual_device == 'cuda':
+                print('\n已检测到 NVIDIA CUDA，将使用 GPU 加速模式进行推理\n')
+            else:
+                print('\n当前使用 CPU 模式。如果是 Mac (Apple Silicon)，建议设置 devtype=mlx 或 devtype=auto\n如果有 NVIDIA 显卡并已安装 CUDA，可设置 devtype=cuda\n')
+            
             host = cfg.web_address.split(':')
             http_server = WSGIServer((host[0], int(host[1])), app, handler_class=CustomRequestHandler)
             threading.Thread(target=tool.openweb, args=(cfg.web_address,)).start()
