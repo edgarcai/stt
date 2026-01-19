@@ -16,6 +16,7 @@ from stslib.whisper_adapter import WhisperModelAdapter, get_optimal_device, crea
 import time
 from werkzeug.utils import secure_filename
 import uuid
+import traceback
 
 class CustomRequestHandler(WSGIHandler):
     def log_request(self):
@@ -146,6 +147,7 @@ def shibie():
             except Exception as e:
                 err=f'从 huggingface.co 下载模型 {model} 失败，请检查网络连接' if model.find('/')>0 else ''
                 cfg.progressresult[key]='error:'+err+str(e)
+                app.logger.error(traceback.format_exc())
                 return
         try:
             segments,info = modelobj.transcribe(
@@ -192,7 +194,8 @@ def shibie():
             cfg.progressresult[key]=raw_subtitles
         except Exception as e:
             cfg.progressresult[key]='error:'+str(e)
-            print(str(e))
+            app.logger.error(traceback.format_exc())
+            print(traceback.format_exc())
 
 
 

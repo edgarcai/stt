@@ -7,6 +7,8 @@ FunASR 是阿里达摩院/通义实验室开发的语音识别工具包，支持
 """
 
 import os
+import shutil
+from typing import Iterable, Optional
 
 
 # 获取 stslib 目录路径
@@ -143,6 +145,78 @@ class FunASRModelAdapter:
             "trust_remote_code": True,
             "remote_code": os.path.join(_STSLIB_DIR, "funasr_model.py")
         }
+
+    def _get_modelscope_cache_root(self) -> str:
+        """
+        获取 ModelScope 缓存根目录。
+
+        Returns:
+            str: ModelScope 缓存根目录绝对路径
+        """
+        # 如果指定了下载根目录，使用 os.path.join(download_root, "modelscope")
+        if self.download_root:
+            return os.path.join(self.download_root, "modelscope")
+        # 未指定时，默认使用项目根目录下的 models/modelscope 目录
+        _ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        default_cache_root = os.path.join(_ROOT_DIR, "models", "modelscope")
+        return os.environ.get("MODELSCOPE_CACHE", default_cache_root)
+
+    def _get_modelscope_model_dir(self, model_id: str) -> str:
+        """
+        根据模型 ID 计算其在 ModelScope 缓存中的目录路径。
+
+        Args:
+            model_id: 模型 ID（如 "FunAudioLLM/Fun-ASR-Nano-2512" 或 "fsmn-vad"）
+
+        Returns:
+            str: 对应的缓存目录路径
+        """
+        cache_root = self._get_modelscope_cache_root()
+        parts = [p for p in str(model_id).split("/") if p]
+        return os.path.join(cache_root, "hub", "models", *parts)
+
+    def _is_zip_related_load_error(self, err: BaseException) -> bool:
+        """
+        判断异常是否为常见的 npz/zip 读取损坏类错误。
+
+        Args:
+            err: 捕获到的异常
+
+        Returns:
+            bool: 若判断为 zip/npz 读取损坏错误则返回 True
+        """
+        msg = str(err)
+        return "Input must be a zip file" in msg or "zipfile.ZipFile" in msg
+
+    def _repair_modelscope_cache_if_needed(self, err: BaseException, model_ids: Iterable[Optional[str]]) -> bool:
+        """
+        当检测到 zip/npz 读取损坏错误时，尝试清理对应模型的 ModelScope 缓存并返回是否清理成功。
+
+        Args:
+            err: 触发的异常
+            model_ids: 需要尝试清理的模型 ID 列表
+
+        Returns:
+            bool: 若发生清理动作返回 True，否则返回 False
+        """
+        if not self._is_zip_related_load_error(err):
+            return False
+
+        cache_root = self._get_modelscope_cache_root()
+        cleaned_any = False
+        for model_id in model_ids:
+            if not model_id:
+                continue
+            model_dir = self._get_modelscope_model_dir(model_id)
+            if not os.path.isdir(model_dir):
+                continue
+            normalized_root = os.path.realpath(cache_root)
+            normalized_dir = os.path.realpath(model_dir)
+            if not normalized_dir.startswith(normalized_root + os.sep):
+                continue
+            shutil.rmtree(model_dir, ignore_errors=True)
+            cleaned_any = True
+        return cleaned_any
     
     def _load_model(self):
         """加载模型（延迟加载）"""
@@ -158,6 +232,10 @@ class FunASRModelAdapter:
             )
         
         config = self._model_config
+        if self.download_root:
+            os.environ.setdefault("MODELSCOPE_CACHE", self._get_modelscope_cache_root())
+            os.makedirs(os.environ["MODELSCOPE_CACHE"], exist_ok=True)
+
         model_kwargs = {
             "model": config["model"],
             "device": self.device,
@@ -186,7 +264,22 @@ class FunASRModelAdapter:
         print(f"加载 FunASR 模型: {config['model']}")
         print(f"设备: {self.device}")
         print(f"模型参数: {model_kwargs}")
-        self._model = AutoModel(**model_kwargs)
+        try:
+            self._model = AutoModel(**model_kwargs)
+        except Exception as e:
+            repaired = self._repair_modelscope_cache_if_needed(
+                e,
+                [
+                    config.get("model"),
+                    config.get("vad_model"),
+                    config.get("punc_model"),
+                    config.get("timestamp_model"),
+                ],
+            )
+            if not repaired:
+                raise
+            self._model = AutoModel(**model_kwargs)
+
         print(f"FunASR 模型加载完成")
     
     def transcribe(self, audio_file, **kwargs):

@@ -14,7 +14,8 @@ Whisper 模型适配器模块
 
 import platform
 import os
-import sys
+import shutil
+from pathlib import Path
 
 # 设置 Hugging Face 缓存目录到项目的 models 目录
 # 这样 mlx-whisper 下载的模型也会存储在项目内
@@ -116,29 +117,31 @@ def get_mlx_model_name(model_name):
 # -----------------------------------------------------------------------------
 try:
     import mlx_whisper.whisper
-    
+    import mlx_whisper.load_models
+    from huggingface_hub import snapshot_download
+
     # 获取原始类
     OriginalModelDimensions = mlx_whisper.whisper.ModelDimensions
-    
+
     # 增强 Patch：同时支持位置参数和关键字参数
     def patched_init(self, *args, **kwargs):
         # 参数名列表，对应 dataclass 的字段顺序
         keys = [
-            "n_mels", "n_audio_ctx", "n_audio_state", "n_audio_head", 
-            "n_audio_layer", "n_vocab", "n_text_ctx", "n_text_state", 
+            "n_mels", "n_audio_ctx", "n_audio_state", "n_audio_head",
+            "n_audio_layer", "n_vocab", "n_text_ctx", "n_text_state",
             "n_text_head", "n_text_layer"
         ]
-        
+
         # 处理位置参数
         for i, val in enumerate(args):
             if i < len(keys):
                 setattr(self, keys[i], val)
-                
+
         # 处理关键字参数 (覆盖位置参数，如果有)
         for k in keys:
             if k in kwargs:
                 setattr(self, k, kwargs[k])
-                
+
         # 设置默认值 (如果未设置)
         defaults = {
             "n_mels": 80, "n_audio_ctx": 1500, "n_audio_state": 1280,
@@ -149,12 +152,61 @@ try:
         for k, v in defaults.items():
             if not hasattr(self, k):
                 setattr(self, k, v)
-        
+
         # 忽略其他无关参数
-    
-    # 应用 Patch
+
+    # 应用 ModelDimensions 补丁
     mlx_whisper.whisper.ModelDimensions.__init__ = patched_init
-    print("已应用 mlx-whisper ModelDimensions 兼容性补丁 (v2)")
+
+    # 修改 mlx-whisper 的 load_model 函数，确保它使用我们设置的 HF_HUB_CACHE 环境变量
+    original_load_model = mlx_whisper.load_models.load_model
+
+    def patched_load_model(path_or_hf_repo: str, dtype=None):
+        import mlx.core as mx
+        import mlx.nn as nn
+        from pathlib import Path
+        from mlx_whisper import whisper
+        from mlx.utils import tree_unflatten
+
+        if dtype is None:
+            dtype = mx.float32
+
+        model_path = Path(path_or_hf_repo)
+        if not model_path.exists():
+            # 明确指定 cache_dir 参数为我们设置的 HF_HUB_CACHE 环境变量的值
+            cache_dir = os.environ.get("HF_HUB_CACHE", _MODELS_DIR)
+            model_path = Path(snapshot_download(repo_id=path_or_hf_repo, cache_dir=cache_dir))
+
+        with open(str(model_path / "config.json"), "r") as f:
+            config = json.loads(f.read())
+            config.pop("model_type", None)
+            quantization = config.pop("quantization", None)
+
+        model_args = whisper.ModelDimensions(**config)
+
+        wf = model_path / "weights.safetensors"
+        if not wf.exists():
+            wf = model_path / "weights.npz"
+        weights = mx.load(str(wf))
+
+        model = whisper.Whisper(model_args, dtype)
+
+        if quantization is not None:
+            class_predicate = (
+                lambda p, m: isinstance(m, (nn.Linear, nn.Embedding))
+                and f"{p}.scales" in weights
+            )
+            nn.quantize(model, **quantization, class_predicate=class_predicate)
+
+        weights = tree_unflatten(list(weights.items()))
+        model.update(weights)
+        mx.eval(model.parameters())
+        return model
+
+    # 应用 load_model 补丁
+    mlx_whisper.load_models.load_model = patched_load_model
+
+    print("已应用 mlx-whisper ModelDimensions 和 load_model 兼容性补丁 (v3)")
 
 except ImportError:
     pass
@@ -167,11 +219,11 @@ except Exception as e:
 class WhisperModelAdapter:
     """
     Whisper 模型适配器
-    
+
     提供统一的接口封装 faster-whisper 和 mlx-whisper，
     自动根据设备类型选择合适的后端。
     """
-    
+
     def __init__(self, model_name, device_type="auto", download_root=None):
 
         """
@@ -205,8 +257,17 @@ class WhisperModelAdapter:
         """
         if self._model is not None:
             return
-            
+
         if self.device_type == "mlx":
+            # 检查是否有转换后的模型
+            model_path = Path(_MODELS_DIR) / f"whisper-{self.original_model_name}-mlx"
+            if model_path.exists() and (model_path / "config.json").exists() and (model_path / "weights.safetensors").exists():
+                print(f"加载转换后的模型: {model_path}")
+                self._backend = "mlx"
+                self._model = "mlx_lazy"  # MLX 模型在 transcribe 时加载
+                return
+
+            # 如果没有转换后的模型，尝试加载 mlx-community 仓库的模型
             self._load_mlx_model()
         else:
             self._load_faster_whisper_model()
@@ -274,31 +335,156 @@ class WhisperModelAdapter:
         使用 MLX Whisper 进行转录
         """
         import mlx_whisper
-        
+        from pathlib import Path
+
+        # 检查是否有转换后的模型
+        model_path = Path(_MODELS_DIR) / f"whisper-{self.original_model_name}-mlx"
+        if model_path.exists() and (model_path / "config.json").exists() and (model_path / "weights.safetensors").exists():
+            print(f"使用转换后的模型: {model_path}")
+            mlx_kwargs = {
+                "path_or_hf_repo": str(model_path),
+            }
+
+            try:
+                # 尝试加载并转录
+                if kwargs.get("language") and kwargs["language"] != "auto":
+                    mlx_kwargs["language"] = kwargs["language"]
+                if kwargs.get("initial_prompt"):
+                    mlx_kwargs["initial_prompt"] = kwargs["initial_prompt"]
+
+                mlx_kwargs["word_timestamps"] = True
+
+                print(f"开始 MLX 转录，音频文件: {audio_file}")
+                print(f"MLX 参数: {mlx_kwargs}")
+                result = mlx_whisper.transcribe(audio_file, **mlx_kwargs)
+                print(f"MLX 转录完成")
+
+                return self._convert_mlx_result(result)
+            except Exception as e:
+                print(f"加载本地转换后的模型失败: {e}")
+                print("尝试删除损坏的模型文件并重新转换...")
+                try:
+                    # 删除损坏的模型文件
+                    import shutil
+                    shutil.rmtree(model_path, ignore_errors=True)
+                    print(f"已删除损坏的模型目录: {model_path}")
+                except Exception as cleanup_err:
+                    print(f"删除损坏模型文件失败: {cleanup_err}")
+
+        # 如果没有有效的本地模型，重新尝试下载或转换
         mlx_model_name = get_mlx_model_name(self.original_model_name)
-        
-        # 构建 mlx_whisper 参数
-        mlx_kwargs = {
-            "path_or_hf_repo": mlx_model_name,
-        }
-        
-        # 映射参数
-        # 注意：mlx-whisper 目前不支持 beam_size（Beam search decoder is not yet implemented）
-        if kwargs.get("language") and kwargs["language"] != "auto":
-            mlx_kwargs["language"] = kwargs["language"]
-        if kwargs.get("initial_prompt"):
-            mlx_kwargs["initial_prompt"] = kwargs["initial_prompt"]
-        
-        # 总是启用 word_timestamps 以获得更精确的时间戳
-        mlx_kwargs["word_timestamps"] = True
-        
-        print(f"开始 MLX 转录，音频文件: {audio_file}")
-        print(f"MLX 参数: {mlx_kwargs}")
-        result = mlx_whisper.transcribe(audio_file, **mlx_kwargs)
-        print(f"MLX 转录完成")
-        
-        # 转换为与 faster-whisper 兼容的格式
-        return self._convert_mlx_result(result)
+
+        # 尝试直接使用 mlx-community 仓库的模型
+        try:
+            # 构建 mlx_whisper 参数
+            mlx_kwargs = {
+                "path_or_hf_repo": f"mlx-community/whisper-{self.original_model_name}",
+            }
+
+            # 映射参数
+            if kwargs.get("language") and kwargs["language"] != "auto":
+                mlx_kwargs["language"] = kwargs["language"]
+            if kwargs.get("initial_prompt"):
+                mlx_kwargs["initial_prompt"] = kwargs["initial_prompt"]
+
+            # 总是启用 word_timestamps 以获得更精确的时间戳
+            mlx_kwargs["word_timestamps"] = True
+
+            print(f"开始 MLX 转录，音频文件: {audio_file}")
+            print(f"MLX 参数: {mlx_kwargs}")
+            result = mlx_whisper.transcribe(audio_file, **mlx_kwargs)
+            print(f"MLX 转录完成")
+
+            # 转换为与 faster-whisper 兼容的格式
+            return self._convert_mlx_result(result)
+        except Exception as e:
+            print(f"使用 mlx-community 模型失败: {e}")
+            print("尝试转换 OpenAI 官方模型...")
+
+        # 如果 mlx-community 仓库的模型不可用，尝试转换 OpenAI 官方模型
+        try:
+            import sys
+            sys.path.append("/tmp/mlx-examples-main/whisper")
+            from convert import convert
+            import mlx.core as mx
+
+            # 转换模型
+            print(f"正在转换模型: {mlx_model_name}")
+            model = convert(mlx_model_name, dtype=mx.float16)
+
+            # 保存转换后的模型
+            model_path.mkdir(parents=True, exist_ok=True)
+
+            from mlx.utils import tree_flatten
+            from dataclasses import asdict
+
+            weights = dict(tree_flatten(model.parameters()))
+            mx.save_safetensors(str(model_path / "weights.safetensors"), weights)
+
+            with open(model_path / "config.json", "w") as f:
+                import json
+                config = asdict(model.dims)
+                config["model_type"] = "whisper"
+                json.dump(config, f, indent=4)
+
+            print(f"模型转换成功，保存到: {model_path}")
+
+            # 转换完成后，重新初始化模型以避免线程安全问题
+            print(f"模型转换完成，重新初始化模型...")
+            self._model = None
+            self._backend = None
+            self._load_model()
+
+            # 重新进行转录
+            result = self._transcribe_mlx(audio_file, **kwargs)
+            return result
+        except Exception as e:
+            print(f"模型转换和转录失败: {e}")
+            import traceback
+            print(traceback.format_exc())
+            raise
+
+    def _is_mlx_npz_load_error(self, err: BaseException) -> bool:
+        """
+        判断异常是否为 MLX Whisper 读取模型权重时的 npz/zip 损坏错误。
+
+        Args:
+            err: 捕获到的异常
+
+        Returns:
+            bool: 若判断为 npz/zip 读取损坏错误则返回 True
+        """
+        msg = str(err)
+        return "[load_npz]" in msg and ("Input must be a zip file" in msg or "zip file" in msg)
+
+    def _purge_hf_repo_cache(self, repo_id: str) -> bool:
+        """
+        清理指定 HuggingFace 仓库在本地的缓存目录（仅限模型权重损坏时使用）。
+
+        Args:
+            repo_id: HuggingFace 仓库 ID（如 "openai/whisper-tiny"）
+
+        Returns:
+            bool: 若执行了清理动作返回 True，否则返回 False
+        """
+        if not repo_id or os.path.exists(repo_id):
+            return False
+        if "/" not in repo_id:
+            return False
+
+        org, name = repo_id.split("/", 1)
+        cache_root = os.environ.get("HF_HUB_CACHE", _MODELS_DIR)
+        target_dir = os.path.join(cache_root, "hub", f"models--{org}--{name}")
+        if not os.path.isdir(target_dir):
+            return False
+
+        normalized_root = os.path.realpath(cache_root)
+        normalized_target = os.path.realpath(target_dir)
+        if not normalized_target.startswith(normalized_root + os.sep):
+            return False
+
+        shutil.rmtree(target_dir, ignore_errors=True)
+        return True
     
     def _convert_mlx_result(self, result):
         """
@@ -372,19 +558,23 @@ class WhisperModelAdapter:
 def create_whisper_model(model_name, device_type="auto", download_root=None):
     """
     创建语音识别模型实例的工厂函数
-    
+
     自动检测模型类型并返回对应的适配器：
     - Whisper 模型 -> WhisperModelAdapter
     - FunASR 模型 -> FunASRModelAdapter
-    
+
     Args:
         model_name: 模型名称
         device_type: 设备类型
-        download_root: 模型下载目录
-        
+        download_root: 模型下载目录，默认使用项目的 models 目录
+
     Returns:
         适配器实例 (WhisperModelAdapter 或 FunASRModelAdapter)
     """
+    # 如果未指定下载根目录，默认使用项目的 models 目录
+    if download_root is None:
+        download_root = _MODELS_DIR
+
     # 检查是否为 FunASR 模型
     try:
         from stslib.funasr_adapter import is_funasr_model, FunASRModelAdapter
@@ -392,7 +582,6 @@ def create_whisper_model(model_name, device_type="auto", download_root=None):
             return FunASRModelAdapter(model_name, device_type, download_root)
     except ImportError:
         pass
-    
+
     # 默认使用 Whisper 适配器
     return WhisperModelAdapter(model_name, device_type, download_root)
-

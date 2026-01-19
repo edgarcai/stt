@@ -43,6 +43,9 @@ def parse_ini(file=os.path.join(ROOT_DIR,'set.ini')):
                 sets[line[0]]=int(line[1])
             elif line[1].find(',')>0:
                 sets[line[0]]=line[1].split(',')
+            elif line[0] == 'model_list':
+                # model_list 始终解析为列表，即使只有一个模型
+                sets[line[0]] = [line[1]] if line[1] else []
             elif line[1]:
                 sets[line[0]]=str(line[1]).lower()
     if sets['opencc'] == 's2t':
