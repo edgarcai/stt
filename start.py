@@ -188,10 +188,38 @@ def shibie():
                     raw_subtitles.append(text)
                 else:
                     raw_subtitles.append(f'{len(raw_subtitles) + 1}\n{startTime} --> {endTime}\n{text}\n')
-            cfg.progressbar[key]=1
-            if data_type != 'json':
+            # AI 错别字校正
+            if sets.get('ai_correction') and raw_subtitles:
+                try:
+                    from stslib.ai_corrector import AICorrector
+                    print("开始 AI 错别字校正...")
+                    
+                    ai_config = {
+                        "base_url": sets.get('ai_base_url', 'https://integrate.api.nvidia.com/v1'),
+                        "api_key": sets.get('ai_api_key', ''),
+                        "model": sets.get('ai_model', 'deepseek-ai/deepseek-v3.2'),
+                    }
+                    corrector = AICorrector(ai_config)
+                    
+                    if data_type == 'json':
+                        # JSON 格式：校正每个段落的 text 字段
+                        raw_subtitles = corrector.correct_srt_segments(raw_subtitles)
+                    elif data_type == 'srt':
+                        # SRT 格式：校正整个字幕字符串
+                        raw_subtitles = corrector.correct_srt_string('\n'.join(raw_subtitles))
+                    else:
+                        # 纯文本格式：按行校正
+                        corrected_lines = corrector.correct_texts(raw_subtitles)
+                        raw_subtitles = '\n'.join(corrected_lines)
+                    
+                    print("AI 错别字校正完成")
+                except Exception as e:
+                    print(f"AI 校正失败，使用原文: {e}")
+            
+            if data_type != 'json' and isinstance(raw_subtitles, list):
                 raw_subtitles = "\n".join(raw_subtitles)
             cfg.progressresult[key]=raw_subtitles
+            cfg.progressbar[key]=1
         except Exception as e:
             cfg.progressresult[key]='error:'+str(e)
             app.logger.error(traceback.format_exc())
@@ -403,7 +431,35 @@ def _api_process(model_name,wav_file,language=None,response_format="text",prompt
             raw_subtitles.append(text)
         else:
             raw_subtitles.append(f'{len(raw_subtitles) + 1}\n{startTime} --> {endTime}\n{text}\n')
-    if response_format != 'json':
+    
+    # AI 错别字校正
+    if sets.get('ai_correction') and raw_subtitles:
+        try:
+            from stslib.ai_corrector import AICorrector
+            print("API: 开始 AI 错别字校正...")
+            
+            ai_config = {
+                "base_url": sets.get('ai_base_url', 'https://integrate.api.nvidia.com/v1'),
+                "api_key": sets.get('ai_api_key', ''),
+                "model": sets.get('ai_model', 'deepseek-ai/deepseek-v3.2'),
+            }
+            corrector = AICorrector(ai_config)
+            
+            if response_format == 'json':
+                raw_subtitles = corrector.correct_srt_segments(raw_subtitles)
+            elif response_format == 'srt':
+                srt_content = "\n".join(raw_subtitles)
+                raw_subtitles = corrector.correct_srt_string(srt_content)
+                return raw_subtitles  # 直接返回校正后的字符串
+            else:
+                corrected_texts = corrector.correct_texts(raw_subtitles)
+                raw_subtitles = corrected_texts
+            
+            print("API: AI 错别字校正完成")
+        except Exception as e:
+            print(f"API: AI 校正失败，使用原文: {e}")
+    
+    if response_format != 'json' and isinstance(raw_subtitles, list):
         raw_subtitles = "\n".join(raw_subtitles)
     return raw_subtitles
     
