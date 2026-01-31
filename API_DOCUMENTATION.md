@@ -57,30 +57,6 @@
 | `srt` | SRT 字幕格式 | 带时间戳的字幕 |
 | `json` | JSON 结构化数据 | 包含行号、时间、文本 |
 
-### 1.5 AI 错别字校正
-
-系统支持使用 AI 大语言模型对识别结果进行错别字自动校正。
-
-**功能特性：**
-- 使用 DeepSeek V3.2 模型进行智能校正
-- 自动识别并修正同音字、形近字错误
-- 保持原有时间戳和格式不变
-- 支持所有输出格式（text、srt、json）
-
-**配置方式（set.ini）：**
-
-```ini
-; 启用/禁用 AI 校正
-ai_correction=true
-
-; AI API 配置
-ai_base_url=https://integrate.api.nvidia.com/v1
-ai_api_key=your-api-key
-ai_model=deepseek-ai/deepseek-v3.2
-```
-
-> **注意**：AI 校正会增加少量处理时间，但能显著提升字幕质量。如需禁用，将 `ai_correction` 设为 `false`。
-
 ---
 
 ## 二、OpenAI 兼容接口

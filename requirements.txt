@@ -9,4 +9,3 @@ opencc-python-reimplemented
 mlx-whisper; sys_platform == 'darwin'
 funasr
 transformers
-openai
